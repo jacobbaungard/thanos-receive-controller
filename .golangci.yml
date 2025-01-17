@@ -20,6 +20,11 @@ linters:
   - paralleltest
   - typecheck
   - cyclop
+  - exhaustruct
+  - depguard
+  - perfsprint
+  - maligned
+  - gosec
 
 linters-settings:
   errcheck:

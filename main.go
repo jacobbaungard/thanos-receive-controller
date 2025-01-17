@@ -35,7 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
+	"k8s.io/kubectl/pkg/util/podutils"
 )
 
 type label = string
@@ -58,25 +58,33 @@ const (
 	other  label = "other"
 )
 
-func main() {
-	config := struct {
-		KubeConfig             string
-		Namespace              string
-		StatefulSetLabel       string
-		ClusterDomain          string
-		ConfigMapName          string
-		ConfigMapGeneratedName string
-		FileName               string
-		Port                   int
-		Scheme                 string
-		InternalAddr           string
-		AllowOnlyReadyReplicas bool
-		ScaleTimeout           time.Duration
-	}{}
+type CmdConfig struct {
+	KubeConfig             string
+	Namespace              string
+	StatefulSetLabel       string
+	Label                  string
+	ClusterDomain          string
+	ConfigMapName          string
+	ConfigMapGeneratedName string
+	FileName               string
+	Port                   int
+	Scheme                 string
+	InternalAddr           string
+	AllowOnlyReadyReplicas bool
+	AllowDynamicScaling    bool
+	AnnotatePodsOnChange   bool
+	ScaleTimeout           time.Duration
+	useAzAwareHashRing     bool
+	podAzAnnotationKey     string
+}
+
+func parseFlags() CmdConfig {
+	var config CmdConfig
 
 	flag.StringVar(&config.KubeConfig, "kubeconfig", "", "Path to kubeconfig")
 	flag.StringVar(&config.Namespace, "namespace", "default", "The namespace to watch")
-	flag.StringVar(&config.StatefulSetLabel, "statefulset-label", "controller.receive.thanos.io=thanos-receive-controller", "The label StatefulSets must have to be watched by the controller")
+	flag.StringVar(&config.StatefulSetLabel, "statefulset-label", "", "[DEPRECATED] The label StatefulSets must have to be watched by the controller")
+	flag.StringVar(&config.Label, "label", "controller.receive.thanos.io=thanos-receive-controller", "The label workloads must have to be watched by the controller.")
 	flag.StringVar(&config.ClusterDomain, "cluster-domain", "cluster.local", "The DNS domain of the cluster")
 	flag.StringVar(&config.ConfigMapName, "configmap-name", "", "The name of the original ConfigMap containing the hashring tenant configuration")
 	flag.StringVar(&config.ConfigMapGeneratedName, "configmap-generated-name", "", "The name of the generated and populated ConfigMap")
@@ -85,14 +93,33 @@ func main() {
 	flag.StringVar(&config.Scheme, "scheme", "http", "The URL scheme on which receive components accept write requests")
 	flag.StringVar(&config.InternalAddr, "internal-addr", ":8080", "The address on which internal server runs")
 	flag.BoolVar(&config.AllowOnlyReadyReplicas, "allow-only-ready-replicas", false, "Populate only Ready receiver replicas in the hashring configuration")
+	flag.BoolVar(&config.AllowDynamicScaling, "allow-dynamic-scaling", false, "Update the hashring configuration on scale down events.")
+	flag.BoolVar(&config.AnnotatePodsOnChange, "annotate-pods-on-change", false, "Annotates pods with current timestamp on a hashring change")
 	flag.DurationVar(&config.ScaleTimeout, "scale-timeout", defaultScaleTimeout, "A timeout to wait for receivers to really start after they report healthy")
+	flag.BoolVar(&config.useAzAwareHashRing, "use-az-aware-hashring", false, "A boolean to use az aware hashring to comply with Thanos v0.32+")
+	flag.StringVar(&config.podAzAnnotationKey, "pod-az-annotation-key", "", "pod annotation key for AZ Info, If not specified or key not found, will use sts name as AZ key")
 	flag.Parse()
 
+	return config
+}
+
+func main() {
 	logger := log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr))
 	logger = log.WithPrefix(logger, "ts", log.DefaultTimestampUTC)
 	logger = log.WithPrefix(logger, "caller", log.DefaultCaller)
 
-	labelKey, labelValue := splitLabel(config.StatefulSetLabel)
+	config := parseFlags()
+
+	var tmpControllerLabel string
+	if len(config.StatefulSetLabel) > 0 {
+		tmpControllerLabel = config.StatefulSetLabel
+
+		level.Warn(logger).Log("msg", "The --statefulset-label flag is deprecated. Please see the manual page for updates.")
+	} else {
+		tmpControllerLabel = config.Label
+	}
+
+	labelKey, labelValue := splitLabel(tmpControllerLabel)
 
 	konfig, err := clientcmd.BuildConfigFromFlags("", config.KubeConfig)
 	if err != nil {
@@ -128,7 +155,11 @@ func main() {
 			labelKey:               labelKey,
 			labelValue:             labelValue,
 			allowOnlyReadyReplicas: config.AllowOnlyReadyReplicas,
+			annotatePodsOnChange:   config.AnnotatePodsOnChange,
+			allowDynamicScaling:    config.AllowDynamicScaling,
 			scaleTimeout:           config.ScaleTimeout,
+			useAzAwareHashRing:     config.useAzAwareHashRing,
+			podAzAnnotationKey:     config.podAzAnnotationKey,
 		}
 		c := newController(klient, logger, opt)
 		c.registerMetrics(reg)
@@ -258,44 +289,44 @@ func newReflectorMetrics(reg *prometheus.Registry) prometheusReflectorMetrics {
 
 const labelParts = 2
 
-func splitLabel(in string) (key, value string) {
+func splitLabel(in string) (string, string) {
 	parts := strings.Split(in, "=")
 	if len(parts) != labelParts {
-		stdlog.Fatal("--statefulset-label must be of the form 'key=value'")
+		stdlog.Fatal("Labels consist of a key-value pair f.ex: 'key=value'")
 	}
 
 	return parts[0], parts[1]
 }
 
-func (p prometheusReflectorMetrics) NewListsMetric(name string) cache.CounterMetric {
+func (p prometheusReflectorMetrics) NewListsMetric(_ string) cache.CounterMetric {
 	return p.listsMetric
 }
 
-func (p prometheusReflectorMetrics) NewListDurationMetric(name string) cache.SummaryMetric {
+func (p prometheusReflectorMetrics) NewListDurationMetric(_ string) cache.SummaryMetric {
 	return p.listDurationMetric
 }
 
-func (p prometheusReflectorMetrics) NewItemsInListMetric(name string) cache.SummaryMetric {
+func (p prometheusReflectorMetrics) NewItemsInListMetric(_ string) cache.SummaryMetric {
 	return p.itemsInListMetric
 }
 
-func (p prometheusReflectorMetrics) NewWatchesMetric(name string) cache.CounterMetric {
+func (p prometheusReflectorMetrics) NewWatchesMetric(_ string) cache.CounterMetric {
 	return p.watchesMetric
 }
 
-func (p prometheusReflectorMetrics) NewShortWatchesMetric(name string) cache.CounterMetric {
+func (p prometheusReflectorMetrics) NewShortWatchesMetric(_ string) cache.CounterMetric {
 	return p.shortWatchesMetric
 }
 
-func (p prometheusReflectorMetrics) NewWatchDurationMetric(name string) cache.SummaryMetric {
+func (p prometheusReflectorMetrics) NewWatchDurationMetric(_ string) cache.SummaryMetric {
 	return p.watchDurationMetric
 }
 
-func (p prometheusReflectorMetrics) NewItemsInWatchMetric(name string) cache.SummaryMetric {
+func (p prometheusReflectorMetrics) NewItemsInWatchMetric(_ string) cache.SummaryMetric {
 	return p.itemsInWatchMetric
 }
 
-func (p prometheusReflectorMetrics) NewLastResourceVersionMetric(name string) cache.GaugeMetric {
+func (p prometheusReflectorMetrics) NewLastResourceVersionMetric(_ string) cache.GaugeMetric {
 	return p.lastResourceVersionMetric
 }
 
@@ -310,7 +341,11 @@ type options struct {
 	labelKey               string
 	labelValue             string
 	allowOnlyReadyReplicas bool
+	allowDynamicScaling    bool
+	annotatePodsOnChange   bool
 	scaleTimeout           time.Duration
+	useAzAwareHashRing     bool
+	podAzAnnotationKey     string
 }
 
 type controller struct {
@@ -434,16 +469,24 @@ func (c *controller) run(ctx context.Context, stop <-chan struct{}) error {
 		return err
 	}
 
-	c.cmapInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := c.cmapInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(_ interface{}) { c.queue.add() },
 		DeleteFunc: func(_ interface{}) { c.queue.add() },
 		UpdateFunc: func(_, _ interface{}) { c.queue.add() },
 	})
-	c.ssetInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if err != nil {
+		return err
+	}
+
+	_, err = c.ssetInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(_ interface{}) { c.queue.add() },
 		DeleteFunc: func(_ interface{}) { c.queue.add() },
 		UpdateFunc: func(_, _ interface{}) { c.queue.add() },
 	})
+
+	if err != nil {
+		return err
+	}
 
 	go c.worker(ctx)
 
@@ -517,10 +560,11 @@ func (c *controller) sync(ctx context.Context) {
 		return
 	}
 
-	statefulsets := make(map[string]*appsv1.StatefulSet)
+	statefulsets := make(map[string][]*appsv1.StatefulSet)
 
 	for _, obj := range c.ssetInf.GetStore().List() {
 		sts, ok := obj.(*appsv1.StatefulSet)
+
 		if !ok {
 			level.Error(c.logger).Log("msg", "failed type assertion from expected StatefulSet")
 		}
@@ -531,36 +575,54 @@ func (c *controller) sync(ctx context.Context) {
 		}
 
 		// If there's an increase in replicas we poll for the new replicas to be ready
-		if _, ok := c.replicas[hashring]; ok && c.replicas[hashring] < *sts.Spec.Replicas {
+		if _, ok := c.replicas[sts.Name]; ok && c.replicas[sts.Name] < *sts.Spec.Replicas {
 			// Iterate over new replicas to wait until they are running
-			for i := c.replicas[hashring]; i < *sts.Spec.Replicas; i++ {
+			for i := c.replicas[sts.Name]; i < *sts.Spec.Replicas; i++ {
 				start := time.Now()
 				podName := fmt.Sprintf("%s-%d", sts.Name, i)
 
 				if err := c.waitForPod(ctx, podName); err != nil {
 					level.Warn(c.logger).Log("msg", "failed polling until pod is ready", "pod", podName, "duration", time.Since(start), "err", err)
-					continue
+					return
 				}
 
 				level.Debug(c.logger).Log("msg", "waited until new pod was ready", "pod", podName, "duration", time.Since(start))
 			}
 		}
 
-		c.replicas[hashring] = *sts.Spec.Replicas
-		statefulsets[hashring] = sts.DeepCopy()
+		c.replicas[sts.Name] = *sts.Spec.Replicas
+
+		if _, ok := statefulsets[hashring]; !ok {
+			statefulsets[hashring] = []*appsv1.StatefulSet{}
+		}
+		// Append the new value to the slice associated with the hashring key
+		statefulsets[hashring] = append(statefulsets[hashring], sts.DeepCopy())
+		level.Info(c.logger).Log("msg ", "hashring got a new statefulset", "hashring", hashring, "statefulset", sts.Name)
 
 		time.Sleep(c.options.scaleTimeout) // Give some time for all replicas before they receive hundreds req/s
 	}
 
-	c.populate(hashrings, statefulsets)
+	c.populate(ctx, hashrings, statefulsets)
+	level.Info(c.logger).Log("msg", "hashring populated", "hashring", fmt.Sprintf("%+v", hashrings))
 
-	if err := c.saveHashring(ctx, hashrings, cm); err != nil {
+	err = c.saveHashring(ctx, hashrings, cm)
+
+	if err != nil {
 		c.reconcileErrors.WithLabelValues(save).Inc()
-		level.Error(c.logger).Log("msg", "failed to save hashrings")
+		level.Error(c.logger).Log("msg", "failed to save hashrings", "err", err)
+	}
+
+	// If enabled and hashring was successfully changed, annotate pods with config hash on change.
+	// This should update the configmap inside the pod instantaneously as well, as
+	// opposed to having to wait kubelet sync period + cache (see
+	// https://kubernetes.io/docs/tasks/configure-pod-container/configure-pod-configmap/#mounted-configmaps-are-updated-automatically)
+	if err == nil && c.options.annotatePodsOnChange {
+		c.annotatePods(ctx)
 	}
 }
 
 func (c controller) waitForPod(ctx context.Context, name string) error {
+	//nolint:staticcheck
 	return wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
 		pod, err := c.klient.CoreV1().Pods(c.options.namespace).Get(ctx, name, metav1.GetOptions{})
 		if kerrors.IsNotFound(err) {
@@ -572,7 +634,7 @@ func (c controller) waitForPod(ctx context.Context, name string) error {
 		switch pod.Status.Phase {
 		case corev1.PodRunning:
 			if c.options.allowOnlyReadyReplicas {
-				if podutil.IsPodReady(pod) {
+				if podutils.IsPodReady(pod) {
 					return true, nil
 				}
 				return false, nil
@@ -586,36 +648,83 @@ func (c controller) waitForPod(ctx context.Context, name string) error {
 	})
 }
 
-//nolint:nestif
-func (c *controller) populate(hashrings []receive.HashringConfig, statefulsets map[string]*appsv1.StatefulSet) {
+func (c *controller) populate(ctx context.Context, hashrings []receive.HashringConfig, statefulsets map[string][]*appsv1.StatefulSet) {
 	for i, h := range hashrings {
-		if sts, exists := statefulsets[h.Hashring]; exists {
-			var endpoints []string
+		stsList, exists := statefulsets[h.Hashring]
 
+		if !exists {
+			continue
+		}
+
+		var endpoints []receive.Endpoint
+
+		for _, sts := range stsList {
 			for i := 0; i < int(*sts.Spec.Replicas); i++ {
-				// If cluster domain is empty string we don't want dot after svc.
-				clusterDomain := ""
-				if c.options.clusterDomain != "" {
-					clusterDomain = fmt.Sprintf(".%s", c.options.clusterDomain)
+				podName := fmt.Sprintf("%s-%d", sts.Name, i)
+				pod, err := c.klient.CoreV1().Pods(c.options.namespace).Get(ctx, podName, metav1.GetOptions{})
+
+				if c.options.allowDynamicScaling {
+					if kerrors.IsNotFound(err) {
+						continue
+					}
+					// Do not add a replica to the hashring if pod is not Ready.
+					if !podutils.IsPodReady(pod) {
+						level.Warn(c.logger).Log("msg", "failed adding pod to hashring, pod not ready", "pod", podName, "err", err)
+						continue
+					}
+
+					if pod.ObjectMeta.DeletionTimestamp != nil && (pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodPending) {
+						// Pod is terminating, do not add it to the hashring.
+						continue
+					}
 				}
+				// If cluster domain is empty string we don't want dot after svc.
 
-				endpoints = append(endpoints,
-					fmt.Sprintf("%s-%d.%s.%s.svc%s:%d",
-						sts.Name,
-						i,
-						sts.Spec.ServiceName,
-						c.options.namespace,
-						clusterDomain,
-						c.options.port,
-					),
-				)
+				endpoint := *c.populateEndpoint(sts, i, err, pod)
+				endpoints = append(endpoints, endpoint)
+
+				level.Info(c.logger).Log("msg", "Hashring got an endpoint", "hashring", h.Hashring, "endpoint:", endpoint.Address, "AZ", endpoint.AZ)
 			}
+		}
 
-			hashrings[i].Endpoints = endpoints
-			c.hashringNodes.WithLabelValues(h.Hashring).Set(float64(len(endpoints)))
-			c.hashringTenants.WithLabelValues(h.Hashring).Set(float64(len(h.Tenants)))
+		hashrings[i].Endpoints = endpoints
+		c.hashringNodes.WithLabelValues(h.Hashring).Set(float64(len(endpoints)))
+		c.hashringTenants.WithLabelValues(h.Hashring).Set(float64(len(h.Tenants)))
+	}
+}
+
+func (c *controller) populateEndpoint(sts *appsv1.StatefulSet, podIndex int, err error, pod *corev1.Pod) *receive.Endpoint {
+	// If cluster domain is empty string we don't want dot after svc.
+	clusterDomain := ""
+	if c.options.clusterDomain != "" {
+		clusterDomain = fmt.Sprintf(".%s", c.options.clusterDomain)
+	}
+
+	endpoint := receive.Endpoint{
+		Address: fmt.Sprintf("%s-%d.%s.%s.svc%s:%d",
+			sts.Name,
+			podIndex,
+			sts.Spec.ServiceName,
+			c.options.namespace,
+			clusterDomain,
+			c.options.port,
+		),
+	}
+
+	if c.options.useAzAwareHashRing {
+		// If pod annotation value is not found or key not specified,
+		// endpoint will use the Statefulset name as AZ name
+		endpoint.AZ = sts.Name
+
+		if c.options.podAzAnnotationKey != "" && err == nil {
+			annotationValue, ok := pod.Annotations[c.options.podAzAnnotationKey]
+			if ok {
+				endpoint.AZ = annotationValue
+			}
 		}
 	}
+
+	return &endpoint
 }
 
 func (c *controller) saveHashring(ctx context.Context, hashring []receive.HashringConfig, orgCM *corev1.ConfigMap) error {
@@ -677,6 +786,38 @@ func (c *controller) saveHashring(ctx context.Context, hashring []receive.Hashri
 	c.configmapLastSuccessfulChangeTime.Set(float64(time.Now().Unix()))
 
 	return nil
+}
+
+func (c *controller) annotatePods(ctx context.Context) {
+	annotationKey := fmt.Sprintf("%s/%s", c.options.labelKey, "lastControllerUpdate")
+	updateTime := fmt.Sprintf("%d", time.Now().Unix())
+
+	// Select pods that have a controllerLabel matching ours.
+	podList, err := c.klient.CoreV1().Pods(c.options.namespace).List(ctx,
+		metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", c.options.labelKey, c.options.labelValue),
+		})
+	if err != nil {
+		level.Error(c.logger).Log("msg", "failed to list pods belonging to controller", "err", err)
+		return
+	}
+
+	for _, pod := range podList.Items {
+		podObj := pod.DeepCopy()
+
+		annotations := podObj.ObjectMeta.Annotations
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+
+		annotations[annotationKey] = updateTime
+		podObj.SetAnnotations(annotations)
+
+		_, err := c.klient.CoreV1().Pods(pod.Namespace).Update(ctx, podObj, metav1.UpdateOptions{})
+		if err != nil {
+			level.Error(c.logger).Log("msg", "failed to update pod", "err", err)
+		}
+	}
 }
 
 // hashAsMetricValue generates metric value from hash of data.
